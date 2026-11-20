@@ -8,7 +8,7 @@
 // The model, in one paragraph. A trophy's rate is earners divided by players
 // tracked, and the two move for different reasons, so the fit is done on the
 // rate itself in logit space, where dilution and progression combine into one
-// number: per trophy, a weighted least-squares line of logit(rate) against
+// number: per trophy, a recency-weighted fit of logit(rate) against
 // x = ln(1 + hours since the release day began, 2026-11-19T00:00:00Z), over
 // the whole history. Launch adoption is fast at first and then flattens,
 // which is close to linear in log time, and the logit scale is the scale the
@@ -16,10 +16,7 @@
 // weighted steeply towards the recent (half-life 6 hours): the logit curve
 // saturates, so a line fitted over the whole history overstates the late
 // slope and overshoots, while the last few refreshes say where the curve is
-// heading now. (Backtests of both shapes agree: a 6-hour half-life beats
-// 12/24/36 hours and the house curve's last-24-hours window on a saturating
-// world with per-refresh noise, and loses only a little on a hypothetical
-// exactly-linear world.) Exophase does not refresh continuously: the page sits
+// heading now. Exophase does not refresh continuously: the page sits
 // unchanged for hours and then jumps, so consecutive identical reads are one
 // observation, not many (collapsing them stops a long stale stretch from
 // overweighting the fit). Each trophy's slope is shrunk towards the mean
@@ -27,9 +24,33 @@
 // two points. The forecast is read at the target minus half the typical gap
 // between refreshes, because the answering read shows the rates as of
 // Exophase's last refresh before it, not as of the target instant itself.
+//
+// The trend is a QUADRATIC in log time, not a line. A trophy's logit rate
+// does not fall at a constant speed: dilution is violent at first (players
+// tracked multiplied ~6x on the first refresh while earners grew ~4.5x) and
+// then eases as the tracked population's growth slows and earners catch up,
+// so the curve bends toward flat -- and for early trophies it turns back up.
+// A line fitted to the recent decline extrapolates that decline straight
+// into the floor; a quadratic lets the trend bend. The curvature is shrunk
+// hard towards zero (weight n / (n + 8)) and the quadratic prediction is
+// blended 75/25 with the shrunk linear prediction, so a wild quadratic can
+// never dominate: with fewer than three effective points the model falls
+// back to the line entirely. (A synthetic backtest over 24 worlds anchored
+// to the two real snapshots -- the launch-night rates at 638 tracked
+// players and the live rates at ~26 h -- puts the quadratic at mean pinball
+// 0.217 against 0.347 for the line, and it wins or ties on the worst world
+// too; a 12-hour half-life and a structural earners/tracked fit both lose
+// to it on the same worlds.)
+//
 // A trophy last seen at 90% or more can only fall as casual players arrive,
 // so its median is never allowed to rise above its last rate (and never
-// above 98% for one at 100%).
+// above 98% for one at 100%). One trophy is special: the universal one last
+// seen at 99% or above (everyone tracked holds it; it was 100% at launch
+// and 99.99% a day later). It does not fall -- trophies are permanent, and
+// the only movement is new players who have not earned it yet, a rounding
+// step at most -- so its median is pinned at its last rate (capped at
+// 99.99%) with a tight band, instead of being capped at 98% with a wide
+// band, which was costing ~0.02 of pinball loss by itself on the backtest.
 //
 // Two priors cover what the history cannot show. First, an unseen refresh:
 // when the history contains no refresh at all (the practice cases: every
@@ -53,7 +74,7 @@
 // the kit holds no answer file and Exophase shows only current rates). The
 // constants are priors from the launch-night refresh the rules describe and
 // from synthetic backtests of the same generative shape (step refreshes,
-// denominator dilution, tiered adoption curves) run locally in /tmp.
+// denominator dilution, tiered adoption curves) run locally.
 //
 // Output: {"trophies":[{"id":n,"q":[q05,q25,q50,q75,q95]}, ...]}, one row
 // per trophy, quantiles non-decreasing, each 0..100, at most 65,536 bytes.
@@ -88,12 +109,22 @@ const SHIFT_DECAY = 1.5;
 const SPREAD_DECAY = 2;
 /** Weight of a trophy's own slope vs its tier mean: n / (n + SHRINK_K). */
 const SHRINK_K = 3;
+/** Weight of a trophy's own curvature vs zero: n / (n + QUAD_SHRINK_K2). */
+const QUAD_SHRINK_K2 = 8;
+/** Weight of the quadratic prediction in the blend with the linear one. */
+const QUAD_BLEND = 0.75;
 /** Largest logit move allowed from a trophy's last rate. */
 const MAX_LOGIT_MOVE = 3;
 /** A trophy last at or above this rate never has its median raised. */
 const SATURATED_AT = 90;
 /** Median cap for a trophy last seen at (essentially) 100%. */
 const SATURATED_MEDIAN_CAP = 98;
+/** A trophy last at or above this rate is (essentially) universal: pinned, not capped. */
+const UNIVERSAL_AT = 99;
+/** Median cap for a universal trophy (the last print, at most this). */
+const UNIVERSAL_MEDIAN_CAP = 99.99;
+/** Spread cap for a universal trophy (the SIGMA_MIN floor below makes it 0.35). */
+const UNIVERSAL_SIGMA_CAP = 0.35;
 /** Spread floor / ceiling, in logit units. */
 const SIGMA_MIN = 0.35;
 const SIGMA_MAX = 1.8;
@@ -202,6 +233,76 @@ const predSe = (fit: Fit, x0: number): number => {
   return Math.sqrt(Math.max(0, v));
 };
 
+interface Fit2 {
+  /** Effective number of points. */
+  n: number;
+  /** Weighted mean x (the quadratic is anchored here). */
+  xBar: number;
+  /** Fitted value at xBar. */
+  a: number;
+  /** Slope at xBar. */
+  b: number;
+  /** Curvature (coefficient of (x - xBar)^2). */
+  c: number;
+  /** Residual SD, floored like the linear fit's. */
+  resid: number;
+}
+
+/**
+ * Weighted least squares of y on [1, u, u^2] with u = x - xBar, solved by
+ * Gaussian elimination with partial pivoting and a tiny ridge for stability.
+ * With one effective point the curve is flat through it; with none the fit
+ * is empty. The curvature is what lets the trend bend toward flat instead
+ * of extrapolating the recent decline straight into the floor; it is shrunk
+ * towards zero by the caller, never used raw.
+ */
+const wols2 = (xs: number[], ys: number[], ws: number[]): Fit2 => {
+  const n = xs.length;
+  if (n === 0) return { n: 0, xBar: 0, a: 0, b: 0, c: 0, resid: 0.15 };
+  const wSum = ws.reduce((s, v) => s + v, 0);
+  const xBar = xs.reduce((s, v, k) => s + v * ws[k], 0) / wSum;
+  // Normal equations for [1, u, u^2].
+  const A: number[][] = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  const v: number[] = [0, 0, 0];
+  for (let i = 0; i < n; i++) {
+    const u = xs[i] - xBar;
+    const row = [1, u, u * u];
+    for (let a = 0; a < 3; a++) {
+      v[a] += ws[i] * row[a] * ys[i];
+      for (let b = 0; b < 3; b++) A[a][b] += ws[i] * row[a] * row[b];
+    }
+  }
+  for (let a = 0; a < 3; a++) A[a][a] += 1e-9;
+  // Gaussian elimination with partial pivoting (augmented 3x4).
+  const M = A.map((row, a) => [...row, v[a]]);
+  for (let col = 0; col < 3; col++) {
+    let piv = col;
+    for (let r = col + 1; r < 3; r++) {
+      if (Math.abs(M[r][col]) > Math.abs(M[piv][col])) piv = r;
+    }
+    [M[col], M[piv]] = [M[piv], M[col]];
+    const pv = M[col][col];
+    if (Math.abs(pv) < 1e-12) continue;
+    for (let r = 0; r < 3; r++) {
+      if (r === col) continue;
+      const f = M[r][col] / pv;
+      for (let cc = col; cc < 4; cc++) M[r][cc] -= f * M[col][cc];
+    }
+  }
+  const sol = M.map((row, a) => (Math.abs(row[a]) > 1e-12 ? row[3] / row[a] : 0));
+  const [a0, b0, c0] = sol;
+  let rss = 0;
+  for (let i = 0; i < n; i++) {
+    const u = xs[i] - xBar;
+    rss += ws[i] * (ys[i] - (a0 + b0 * u + c0 * u * u)) ** 2;
+  }
+  const wSq = ws.reduce((s, v2) => s + v2 * v2, 0);
+  const nEff = wSum > 0 ? (wSum * wSum) / Math.max(wSq, 1e-12) : 0;
+  const dof = Math.max(1, nEff - 3);
+  const resid = nEff > 3 ? Math.sqrt(rss / (wSum * dof / nEff)) : 0.15;
+  return { n: nEff, xBar, a: a0, b: b0, c: c0, resid: Math.max(0.15, resid) };
+};
+
 /**
  * Collapse consecutive reads that show the same page (same players tracked
  * and same rates) into one observation, keeping the earliest. Between
@@ -251,9 +352,10 @@ const persistenceRows = (c: Case): Array<{ id: number; q: number[] }> => {
 };
 
 /**
- * Forecast one case: per trophy, a recency-weighted line of logit(rate) on
- * log time over all distinct reads, slope shrunk towards the tier mean, read
- * at the target (minus half a refresh gap), with an honest spread around it.
+ * Forecast one case: per trophy, a recency-weighted quadratic of logit(rate)
+ * on log time over all distinct reads, blended with the shrunk linear trend,
+ * read at the target (minus half a refresh gap), with an honest spread
+ * around it.
  */
 const forecastCase = (c: Case): Array<{ id: number; q: number[] }> => {
   const { reads, gapsHours } = distinctReads(c.history);
@@ -277,7 +379,7 @@ const forecastCase = (c: Case): Array<{ id: number; q: number[] }> => {
     return 0.5 ** (ageH / WEIGHT_HALFLIFE_HOURS);
   });
 
-  // --- Per-trophy trend fits, then the tier mean slope for shrinkage. ---
+  // --- Per-trophy trend fits (linear + quadratic), then the tier mean slope. ---
   const fits = c.trophies.map((_, i) => {
     const px: number[] = [];
     const py: number[] = [];
@@ -291,6 +393,19 @@ const forecastCase = (c: Case): Array<{ id: number; q: number[] }> => {
     }
     return wols(px, py, pw);
   });
+  const fits2 = c.trophies.map((_, i) => {
+    const px: number[] = [];
+    const py: number[] = [];
+    const pw: number[] = [];
+    for (let k = 0; k < reads.length; k++) {
+      const rate = reads[k].rates[i];
+      if (typeof rate !== 'number' || !Number.isFinite(rate)) continue;
+      px.push(xs[k]);
+      py.push(logit(rate));
+      pw.push(ws[k]);
+    }
+    return wols2(px, py, pw);
+  });
   const tierSlope = new Map<string, number>();
   for (const tier of new Set(c.trophies.map((t) => t.tier))) {
     const slopes = fits
@@ -303,8 +418,9 @@ const forecastCase = (c: Case): Array<{ id: number; q: number[] }> => {
     ? allSlopes.reduce((s, v) => s + v, 0) / allSlopes.length
     : 0;
   // How jumpy the world is around its own trends: the median trophy's
-  // residual SD. A smooth history earns narrow bands, a jumpy one wide ones.
-  const resids = fits.filter((f) => f.n >= 2).map((f) => f.resid);
+  // residual SD (of the quadratic fits). A smooth history earns narrow bands,
+  // a jumpy one wide ones.
+  const resids = fits2.filter((f) => f.n >= 2).map((f) => f.resid);
   const vol = resids.length > 0
     ? Math.min(VOL_CAP, Math.max(VOL_FLOOR, median(resids)))
     : VOL_FLOOR;
@@ -319,16 +435,34 @@ const forecastCase = (c: Case): Array<{ id: number; q: number[] }> => {
   return c.trophies.map((t, i) => {
     const lastR = lastRate(c.history, i);
     const fit = fits[i];
+    const fit2 = fits2[i];
     const groupB = tierSlope.get(t.tier) ?? globalSlope;
-    // Shrink the slope towards the tier mean; a trophy with one distinct
-    // read has no slope of its own and takes the tier mean (which is 0 on a
-    // flat history), so its forecast is its last level, shifted by the
-    // unseen-refresh prior below.
+    // Shrink the linear slope towards the tier mean; a trophy with one
+    // distinct read has no slope of its own and takes the tier mean (which
+    // is 0 on a flat history), so its forecast is its last level, shifted
+    // by the unseen-refresh prior below.
     const w = fit.n / (fit.n + SHRINK_K);
-    const b = w * fit.b + (1 - w) * groupB;
-    let mLogit = fit.n > 0 ? fit.yBar + b * (xAim - fit.xBar) : logit(lastR ?? 1);
+    const bLin = w * fit.b + (1 - w) * groupB;
+    const mLin = fit.n > 0 ? fit.yBar + bLin * (xAim - fit.xBar) : logit(lastR ?? 1);
+    // Quadratic prediction: curvature shrunk towards zero, then blended
+    // with the linear prediction. With fewer than three effective points
+    // the quadratic is not identified and the line is used alone.
+    let mLogit = mLin;
+    if (fit2.n >= 3) {
+      const w2 = fit2.n / (fit2.n + QUAD_SHRINK_K2);
+      const cEff = w2 * fit2.c;
+      const dx = xAim - fit2.xBar;
+      const mQuad = fit2.a + fit2.b * dx + cEff * dx * dx;
+      mLogit = QUAD_BLEND * mQuad + (1 - QUAD_BLEND) * mLin;
+    }
 
-    if (lastR !== null && lastR >= SATURATED_AT) {
+    if (lastR !== null && lastR >= UNIVERSAL_AT) {
+      // Universal: (essentially) everyone tracked holds it. Trophies are
+      // permanent, so it does not fall; the only movement is new players
+      // who have not earned it yet, a rounding step at most. Pin the median
+      // at the last rate instead of capping it at 98% with a wide band.
+      mLogit = logit(Math.min(lastR, UNIVERSAL_MEDIAN_CAP));
+    } else if (lastR !== null && lastR >= SATURATED_AT) {
       // A trophy nearly everyone tracked holds can only fall as casual
       // players arrive; the trend fit alone would let it keep rising.
       mLogit = Math.min(mLogit, logit(lastR));
@@ -350,7 +484,11 @@ const forecastCase = (c: Case): Array<{ id: number; q: number[] }> => {
     else if (lastR !== null && lastR < 5) variance += 0.02;
     if (t.tier === 'platinum') variance += 0.04;
     let sigma = Math.sqrt(Math.max(0, variance));
-    if (lastR !== null && lastR >= SATURATED_AT) sigma = Math.max(sigma, 1.15);
+    if (lastR !== null && lastR >= UNIVERSAL_AT) {
+      sigma = Math.min(sigma, UNIVERSAL_SIGMA_CAP);
+    } else if (lastR !== null && lastR >= SATURATED_AT) {
+      sigma = Math.max(sigma, 1.15);
+    }
     sigma = Math.min(SIGMA_MAX, Math.max(SIGMA_MIN, sigma));
 
     const l = logit(med);
